@@ -1,4 +1,4 @@
-// v3.1 — Adds: Excel export, templates (weekly/monthly), stricter RBAC (space memberships), and reminder docs.
+// v3.2 — Full features + Agile UI (Kanban, density, BIDV theme, mobile-friendly)
 const supabase = window.supabase.createClient(window.ENV.SUPABASE_URL, window.ENV.SUPABASE_ANON_KEY);
 const $ = s => document.querySelector(s);
 const $$ = s => Array.from(document.querySelectorAll(s));
@@ -41,7 +41,6 @@ function startOfMonth(d){ return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d){ return new Date(d.getFullYear(), d.getMonth()+1, 0, 23,59,59,999); }
 function within(t, start, end){ const due=new Date(t.due_date); return due>=start && due<=end; }
 
-// Data
 async function fetchSpaces(){ const { data } = await supabase.from('spaces').select('*').order('name'); return data||[]; }
 async function fetchFolders(spaceId){ const { data } = await supabase.from('folders').select('*').eq('space_id', spaceId).order('name'); return data||[]; }
 async function fetchLists(folderId){ const { data } = await supabase.from('lists').select('*').eq('folder_id', folderId).order('name'); return data||[]; }
@@ -49,7 +48,6 @@ async function fetchMembers(){ const { data } = await supabase.from('profiles').
 async function fetchTasks(listId){ let q=supabase.from('tasks').select('*, profiles!tasks_assignee_fkey(full_name,role)').order('due_date',{ascending:true}); if(listId) q=q.eq('list_id', listId); const { data } = await q; return data||[]; }
 async function fetchGoals(listId){ let q=supabase.from('goals').select('*').order('created_at',{ascending:false}); if(listId) q=q.eq('list_id', listId); const { data } = await q; return data||[]; }
 
-// Realtime
 let channel=null;
 async function ensureRealtime(){
   if(channel) return;
@@ -115,6 +113,8 @@ async function renderTasksPage(){
               <button class="btn" onclick="setView('week')">Tuần</button>
               <button class="btn" onclick="setView('month')">Tháng</button>
               <button class="btn" onclick="setView('table')">Bảng</button>
+              <button class="btn" onclick="setView('kanban')">Kanban</button>
+              <button class="btn" onclick="document.body.classList.toggle('dense')">Chế độ thưa/dày</button>
             </div>
             <div class="row">
               <input id="focus" type="date" value="${state.focus}" onchange="renderTasksOnly()">
@@ -128,6 +128,14 @@ async function renderTasksPage(){
             </div>
           </div>
         </div>
+
+        <div class="row" style="gap:6px;margin:8px 0">
+          <button class="btn" onclick="state.filterStatus='all';renderTasksOnly()">Tất cả</button>
+          <button class="btn" onclick="state.filterStatus='todo';renderTasksOnly()">Cần làm</button>
+          <button class="btn" onclick="state.filterStatus='doing';renderTasksOnly()">Đang làm</button>
+          <button class="btn" onclick="state.filterStatus='done';renderTasksOnly()">Hoàn thành</button>
+        </div>
+
         <div id="kpis" class="row" style="gap:12px;margin:10px 0"></div>
         <div class="row" style="gap:8px;margin-bottom:8px">
           <button class="btn" onclick="exportExcel()">Xuất Excel (theo view hiện tại)</button>
@@ -180,6 +188,7 @@ function taskCard(t){
         <span class="badge">${new Date(t.due_date).toLocaleDateString('vi-VN')}</span>
         <span class="badge">${name}</span>
         <span class="badge">KPI: ${t.points||0}</span>
+        <span class="badge status-${t.status}">${t.status}</span>
       </div>
     </div>
     <div class="small" style="margin-top:6px">${t.note||''}</div>
@@ -199,11 +208,13 @@ function renderTasksOnly(){
   if(state.view==='day'){ start=new Date(focus); start.setHours(0,0,0,0); end=new Date(focus); end.setHours(23,59,59,999); label='Ngày'; }
   if(state.view==='week'){ start=startOfWeek(focus); end=endOfWeek(focus); label='Tuần'; }
   if(state.view==='month'){ start=startOfMonth(focus); end=endOfMonth(focus); label='Tháng'; }
-  let items = cache.tasks.filter(t=>state.view==='table'?matchFilters(t):matchFilters(t,start,end));
+  let items = cache.tasks.filter(t=>state.view==='table'||state.view==='kanban'?matchFilters(t):matchFilters(t,start,end));
   renderKPIs(items,label);
   if(state.view==='table'){
     const rows = items.map(t=>`<tr><td>${new Date(t.due_date).toLocaleDateString('vi-VN')}</td><td>${t.title}</td><td>${t.profiles?.full_name||''}</td><td>${t.status}</td><td>${t.points||0}</td><td>${t.note||''}</td></tr>`).join('');
     $("#listArea").innerHTML = `<div class="card"><table><thead><tr><th>Ngày hạn</th><th>Công việc</th><th>Giao cho</th><th>Trạng thái</th><th>KPI</th><th>Ghi chú</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }else if(state.view==='kanban'){
+    $("#listArea").innerHTML = renderKanban(items);
   }else{
     const groups={}; items.forEach(t=>{const k=t.assignee||'ungroup'; (groups[k]=groups[k]||[]).push(t);});
     const html = Object.entries(groups).map(([id,arr])=>{
@@ -235,6 +246,7 @@ async function createTask(){
 async function updateStatus(id,val){ const { error } = await supabase.from('tasks').update({ status:val, done_at: val==='done'?new Date().toISOString():null }).eq('id',id); if(error) alert(error.message); }
 async function removeTask(id){ if(!confirm("Xoá công việc?")) return; const { error } = await supabase.from('tasks').delete().eq('id',id); if(error) alert(error.message); }
 
+// Recurrence
 async function generateRecurring(){
   const title=$("#title").value.trim(); if(!title) return alert("Nhập tên công việc");
   if(!state.list) return alert("Chọn List trước");
@@ -260,7 +272,55 @@ async function generateRecurring(){
   alert(`Đã tạo ${rows.length} việc lặp.`);
 }
 
-// DASHBOARD (thêm Export Excel)
+// Kanban drag & drop
+function kanbanAllowDrop(ev){ ev.preventDefault(); }
+function kanbanDragStart(ev,id){ ev.dataTransfer.setData("text/plain", id); }
+function kanbanDragEnter(el){ el.classList.add('kanban-drop'); }
+function kanbanDragLeave(el){ el.classList.remove('kanban-drop'); }
+async function kanbanDrop(ev, status, el){
+  ev.preventDefault();
+  el.classList.remove('kanban-drop');
+  const id = ev.dataTransfer.getData("text/plain");
+  if(!id) return;
+  await updateStatus(id, status);
+}
+
+// Render Kanban columns
+function renderKanban(items){
+  const columns = { todo:[], doing:[], done:[] };
+  items.forEach(t=>columns[t.status]?.push(t));
+
+  function col(title, key){
+    const cards = columns[key].map(t=>`
+      <div class="task" draggable="true" ondragstart="kanbanDragStart(event,'${t.id}')">
+        <div class="row" style="justify-content:space-between">
+          <b>${t.title}</b>
+          <span class="badge status-${t.status}">${t.status}</span>
+        </div>
+        <div class="small" style="margin-top:6px">
+          <span class="badge">${new Date(t.due_date).toLocaleDateString('vi-VN')}</span>
+          <span class="badge">${t.profiles?.full_name||'—'}</span>
+          <span class="badge">KPI: ${t.points||0}</span>
+        </div>
+      </div>`).join('');
+    return `<div class="kanban-col"
+              ondragover="kanbanAllowDrop(event)"
+              ondragenter="kanbanDragEnter(this)"
+              ondragleave="kanbanDragLeave(this)"
+              ondrop="kanbanDrop(event,'${key}',this)">
+              <h4>${title} <span class="small">(${columns[key].length})</span></h4>
+              <div style="display:grid;gap:8px">${cards || '<div class="small">(trống)</div>'}</div>
+            </div>`;
+  }
+
+  return `<div class="kanban">
+    ${col('Cần làm','todo')}
+    ${col('Đang làm','doing')}
+    ${col('Hoàn thành','done')}
+  </div>`;
+}
+
+// DASHBOARD
 let charts={};
 async function renderDashboardPage(){
   await ensureRealtime();
@@ -307,7 +367,6 @@ async function renderDashboardOnly(){
   if(view==='month'){ start=startOfMonth(focus); end=endOfMonth(focus); }
   let tasks = await fetchTasks(listId);
   tasks = tasks.filter(t=>within(t,start,end));
-  // charts
   const byStatus = {todo:0,doing:0,done:0}; tasks.forEach(t=>{ byStatus[t.status]=(byStatus[t.status]||0)+1; });
   const c1=$("#chartStatus"); if(charts.s) charts.s.destroy();
   charts.s = new Chart(c1, { type:'bar', data:{ labels:['Cần làm','Đang làm','Hoàn thành'], datasets:[{label:'Số việc', data:[byStatus.todo||0,byStatus.doing||0,byStatus.done||0]}] } });
@@ -315,11 +374,10 @@ async function renderDashboardOnly(){
   const labels=Object.keys(byMember), values=labels.map(k=>byMember[k]);
   const c2=$("#chartMembers"); if(charts.m) charts.m.destroy();
   charts.m = new Chart(c2, { type:'bar', data:{ labels, datasets:[{label:'KPI hoàn thành', data:values}] } });
-  // cache for export
   window._dashboard_cache = { tasks, start, end, labels, values, byStatus };
 }
 
-// Export Excel (Tasks view or Dashboard view)
+// Export Excel
 function exportExcel(fromDashboard=false){
   const wb = XLSX.utils.book_new();
   if(fromDashboard && window._dashboard_cache){
@@ -333,13 +391,12 @@ function exportExcel(fromDashboard=false){
     const sheet3 = XLSX.utils.aoa_to_sheet([["Thành viên","KPI hoàn thành"], ...labels.map((n,i)=>[n, values[i]])]);
     XLSX.utils.book_append_sheet(wb, sheet3, "By Member");
   }else{
-    // current filtered tasks in Tasks page
     const focus=new Date($("#focus")?.value||state.focus||todayISO());
     let start,end;
     if(state.view==='day'){ start=new Date(focus); start.setHours(0,0,0,0); end=new Date(focus); end.setHours(23,59,59,999); }
     if(state.view==='week'){ start=startOfWeek(focus); end=endOfWeek(focus); }
     if(state.view==='month'){ start=startOfMonth(focus); end=endOfMonth(focus); }
-    let items = cache.tasks.filter(t=>state.view==='table'?matchFilters(t):matchFilters(t,start,end));
+    let items = cache.tasks.filter(t=>state.view==='table'||state.view==='kanban'?matchFilters(t):matchFilters(t,start,end));
     const sheet = XLSX.utils.json_to_sheet(items.map(t=>({
       due_date: t.due_date, title:t.title, assignee: t.profiles?.full_name||'', status:t.status, points:t.points||0, note:t.note||''
     })));
@@ -438,7 +495,8 @@ async function handleImport(){
   const listId=$("#iList").value; if(!listId) return alert("Chọn List");
   const file=$("#fileInput").files[0]; if(!file) return alert("Chọn file CSV/Excel");
   const log=$("#importLog"); log.textContent='Đang đọc file...';
-  const members=await fetchMembers(); const map={}; members.forEach(m=>map[(m.full_name||'').toLowerCase().trim()]=m.id);
+  const { data: members } = await supabase.from('profiles').select('id,full_name');
+  const map={}; (members||[]).forEach(m=>map[(m.full_name||'').toLowerCase().trim()]=m.id);
   function toRows(rows){ return rows.map(r=>({ title:r.title, due_date:r.due_date, assignee: map[(r.assignee_full_name||'').toLowerCase().trim()]||null, status:(r.status||'todo'), points:parseInt(r.points||'0',10), note:r.note||'', list_id:listId })); }
   if(file.name.endsWith('.csv')){
     Papa.parse(file,{header:true,skipEmptyLines:true,complete:async (res)=>{ const rows=res.data; log.textContent=`Đã đọc ${rows.length} dòng. Đang ghi...`; const {error}=await supabase.from('tasks').insert(toRows(rows)); log.textContent= error?('Lỗi: '+error.message):'Import xong.'; }});
@@ -522,22 +580,13 @@ async function templateWeekly(){
 async function templateMonthly(){
   const folder=$("#tFolder").value; if(!folder) return alert("Chọn Folder");
   const now=new Date(); const month=now.getMonth()+1; const year=now.getFullYear();
-  // Tạo 4 list tuần trong tháng hiện tại (đơn giản hoá)
   const names=[`T${month}-W1`,`T${month}-W2`,`T${month}-W3`,`T${month}-W4`];
   const rows=names.map(n=>({folder_id:folder, name:`${n}/${year}`}));
   const { error } = await supabase.from('lists').insert(rows);
   if(error) alert(error.message); else alert("Đã tạo 4 List tuần cho tháng hiện tại."); await renderTree();
 }
-async function templateGoalWeek(){
-  // tạo goal dựa trên list được chọn ở Goals tab? Đơn giản: yêu cầu chọn list trong Goals khi tạo.
-  alert("Vào tab Goals/KPI để chọn List và bấm Tạo Goal tuần (đã hỗ trợ).");
-}
-async function templateGoalMonth(){
-  alert("Vào tab Goals/KPI để chọn List và bấm Tạo Goal tháng (đã hỗ trợ).");
-}
-
-// Utils isoWeek
-function isoWeek(d){ d=new Date(Date.UTC(d.getFullYear(),d.getMonth(),d.getDate())); const day=d.getUTCDay()||7; d.setUTCDate(d.getUTCDate()+4-day); const yearStart=new Date(Date.UTC(d.getUTCFullYear(),0,1)); const week=Math.ceil((((d-yearStart)/86400000)+1)/7); return {year:d.getUTCFullYear(),week}; }
+async function templateGoalWeek(){ alert("Vào tab Goals/KPI để chọn List và bấm Tạo Goal tuần (đã hỗ trợ)."); }
+async function templateGoalMonth(){ alert("Vào tab Goals/KPI để chọn List và bấm Tạo Goal tháng (đã hỗ trợ)."); }
 
 // Boot
 supabase.auth.onAuthStateChange((_e,_s)=>renderAuth());
